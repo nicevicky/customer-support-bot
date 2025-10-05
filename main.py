@@ -5,11 +5,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 import logging
-
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 import httpx
 from supabase import create_client, Client
+import uvicorn
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -100,14 +100,18 @@ class Database:
             ]
             
             for table_sql in tables:
-                try:
-                    result = self.supabase.rpc('execute_sql', {'sql': table_sql}).execute()
-                except:
-                    # If RPC doesn't work, tables might already exist
-                    pass
-                
+                await self.execute_sql(table_sql)
         except Exception as e:
             logger.error(f"Error initializing tables: {e}")
+
+    async def execute_sql(self, sql: str):
+        """Execute raw SQL"""
+        try:
+            result = self.supabase.rpc('execute_sql', {'sql': sql}).execute()
+            return result
+        except Exception as e:
+            logger.error(f"SQL execution error: {e}")
+            return None
 
     async def add_user(self, user_id: int, username: str, first_name: str, last_name: str):
         try:
@@ -240,8 +244,8 @@ class TelegramBot:
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = Database()
-        self.bot_messages: Dict[int, List[BotMessage]] = {}
-        
+        self.bot_messages: Dict[int, List[BotMessage]] = {}  # Track bot messages for auto-delete
+
     async def send_request(self, method: str, data: dict = None):
         """Send request to Telegram API"""
         url = f"{self.base_url}/{method}"
@@ -263,18 +267,19 @@ class TelegramBot:
             "text": text,
             "parse_mode": "Markdown"
         }
+        
         if reply_markup:
             data["reply_markup"] = reply_markup
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
-            
+
         result = await self.send_request("sendMessage", data)
         
         # Track bot message for auto-delete
         if result and result.get("ok"):
             message_id = result["result"]["message_id"]
             await self.track_bot_message(chat_id, message_id)
-            
+        
         return result
 
     async def delete_message(self, chat_id: int, message_id: int):
@@ -296,6 +301,26 @@ class TelegramBot:
             }
         }
         return await self.send_request("restrictChatMember", data)
+
+    async def get_chat_member(self, chat_id: int, user_id: int):
+        """Get chat member info"""
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id
+        }
+        return await self.send_request("getChatMember", data)
+
+    async def is_admin(self, chat_id: int, user_id: int) -> bool:
+        """Check if user is admin in the group"""
+        try:
+            result = await self.get_chat_member(chat_id, user_id)
+            if result and result.get("ok"):
+                status = result["result"]["status"]
+                return status in ["creator", "administrator"]
+            return False
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            return False
 
     async def track_bot_message(self, chat_id: int, message_id: int):
         """Track bot message for auto-delete"""
@@ -319,21 +344,21 @@ class TelegramBot:
 
     async def schedule_message_deletion(self, bot_message: BotMessage, minutes: int):
         """Schedule message deletion after specified minutes"""
-        await asyncio.sleep(minutes * 60)
+        await asyncio.sleep(minutes * 60)  # Convert minutes to seconds
         try:
             await self.delete_message(bot_message.chat_id, bot_message.message_id)
             
             # Remove from tracking
             if bot_message.chat_id in self.bot_messages:
                 self.bot_messages[bot_message.chat_id] = [
-                    msg for msg in self.bot_messages[bot_message.chat_id] 
+                    msg for msg in self.bot_messages[bot_message.chat_id]
                     if msg.message_id != bot_message.message_id
                 ]
-                
         except Exception as e:
             logger.error(f"Error deleting scheduled message: {e}")
 
     def get_main_menu_keyboard(self):
+        """Get main menu inline keyboard"""
         return {
             "inline_keyboard": [
                 [
@@ -348,6 +373,7 @@ class TelegramBot:
         }
 
     def get_admin_keyboard(self):
+        """Get admin inline keyboard"""
         return {
             "inline_keyboard": [
                 [
@@ -369,7 +395,9 @@ class TelegramBot:
         """Handle /start command"""
         user = message["from"]
         chat_id = message["chat"]["id"]
-        
+        chat_type = message["chat"]["type"]
+        user_id = user["id"]
+
         # Add user to database
         await self.db.add_user(
             user["id"],
@@ -378,7 +406,27 @@ class TelegramBot:
             user.get("last_name", "")
         )
 
-        if message["chat"]["type"] == "private":
+        # Handle /start in group - only allow admins
+        if chat_type in ["group", "supergroup"]:
+            # Check if user is admin in the group
+            if not await self.is_admin(chat_id, user_id):
+                # Ignore the command if user is not admin
+                return
+            
+            # Admin in group - show group management info
+            admin_group_text = (
+                "🔧 Admin Group Commands:\n\n"
+                "/closegroup - Close group for users\n"
+                "/opengroup - Open group for users\n"
+                "/addban <word> - Add banned word\n"
+                "/removeban <word> - Remove banned word\n"
+                "/setautodelete <minutes> - Set auto-delete time\n"
+                "/admin - Show admin panel"
+            )
+            await self.send_message(chat_id, admin_group_text)
+        
+        elif chat_type == "private":
+            # Private chat - show welcome message
             welcome_text = (
                 "👋 Welcome to our Customer Support Bot!\n\n"
                 "🎯 How can we help you today?\n\n"
@@ -390,10 +438,19 @@ class TelegramBot:
         """Handle /admin command"""
         user_id = message["from"]["id"]
         chat_id = message["chat"]["id"]
-        
-        if user_id == ADMIN_ID:
-            admin_text = "🔧 Admin Control Panel\n\nWelcome to the admin dashboard. Choose an option:"
-            await self.send_message(chat_id, admin_text, self.get_admin_keyboard())
+        chat_type = message["chat"]["type"]
+
+        # Check if user is admin
+        if user_id != ADMIN_ID:
+            return
+
+        # Handle /admin in group - check if user is group admin too
+        if chat_type in ["group", "supergroup"]:
+            if not await self.is_admin(chat_id, user_id):
+                return
+
+        admin_text = "🔧 Admin Control Panel\n\nWelcome to the admin dashboard. Choose an option:"
+        await self.send_message(chat_id, admin_text, self.get_admin_keyboard())
 
     async def handle_complaint(self, message: dict):
         """Handle user complaint"""
@@ -454,12 +511,12 @@ class TelegramBot:
             # Mute user
             mute_duration = settings.get("mute_duration", 60)
             mute_until = int((datetime.now() + timedelta(minutes=mute_duration)).timestamp())
-
+            
             await self.restrict_chat_member(chat_id, user["id"], mute_until)
             
             mute_text = f"🔇 @{user.get('username', user.get('first_name', 'User'))} has been muted for {mute_duration} minutes due to repeated violations."
             await self.send_message(chat_id, mute_text)
-
+            
             # Clear warnings after mute
             await self.db.clear_user_warnings(user["id"])
         else:
@@ -500,21 +557,21 @@ class TelegramBot:
         if text == "/closegroup":
             await self.db.update_group_settings({"is_closed": True})
             await self.send_message(chat_id, "🔒 Group has been closed. Only admins can send messages.")
-
+        
         elif text == "/opengroup":
             await self.db.update_group_settings({"is_closed": False})
             await self.send_message(chat_id, "🔓 Group has been opened. Users can send messages.")
-
+        
         elif text.startswith("/addban "):
             word = text.split(" ", 1)[1]
             await self.db.add_banned_word(word)
             await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
-
+        
         elif text.startswith("/removeban "):
             word = text.split(" ", 1)[1]
             await self.db.remove_banned_word(word)
             await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
-
+        
         elif text.startswith("/setautodelete "):
             try:
                 minutes = int(text.split(" ", 1)[1])
@@ -528,10 +585,8 @@ class TelegramBot:
 
     async def handle_callback_query(self, callback_query: dict):
         """Handle callback queries"""
-        data = callback_query["data"]
-        chat_id = callback_query["message"]["chat"]["id"]
         user_id = callback_query["from"]["id"]
-
+        
         if user_id == ADMIN_ID:
             await self.handle_admin_callback(callback_query)
         else:
@@ -545,7 +600,7 @@ class TelegramBot:
         if data == "new_complaint":
             text = "📝 Please write your complaint or question below:\n\n💡 Be as detailed as possible so we can help you better!"
             await self.send_message(chat_id, text)
-
+        
         elif data == "contact_info":
             contact_text = (
                 "📞 Contact Information\n\n"
@@ -555,7 +610,7 @@ class TelegramBot:
                 "🌐 Website: https://example.com"
             )
             await self.send_message(chat_id, contact_text)
-
+        
         elif data == "faq":
             faq_text = (
                 "❓ Frequently Asked Questions\n\n"
@@ -587,7 +642,7 @@ class TelegramBot:
                 f"/setautodelete <minutes> - Set auto-delete time (0 to disable)"
             )
             await self.send_message(chat_id, settings_text)
-
+        
         elif data == "admin_banned_words":
             banned_words = await self.db.get_banned_words()
             if banned_words:
@@ -626,7 +681,7 @@ class TelegramBot:
                         await self.handle_complaint(message)
                 elif str(chat_id) == GROUP_ID:
                     # Handle group messages
-                    if user_id == ADMIN_ID:
+                    if user_id == ADMIN_ID or await self.is_admin(chat_id, user_id):
                         await self.handle_admin_group_commands(message)
                     else:
                         # Check if group is closed
@@ -653,26 +708,6 @@ class TelegramBot:
 # Initialize bot and database
 bot = TelegramBot(BOT_TOKEN)
 database = Database()
-
-# Add root route
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return HTMLResponse("""
-    <html>
-        <head>
-            <title>Telegram Customer Support Bot</title>
-        </head>
-        <body>
-            <h1>🤖 Telegram Customer Support Bot</h1>
-            <p>Bot is running successfully!</p>
-            <ul>
-                <li><a href="/api/health">Health Check</a></li>
-                <li><a href="/api/setwebhook">Set Webhook</a></li>
-            </ul>
-        </body>
-    </html>
-    """)
 
 @app.on_event("startup")
 async def startup_event():
@@ -701,7 +736,6 @@ async def set_webhook(request: Request):
     """Set webhook URL"""
     try:
         webhook_url = f"{request.url.scheme}://{request.headers['host']}/api/webhook"
-        
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
@@ -709,16 +743,14 @@ async def set_webhook(request: Request):
             )
             result = response.json()
             
-        if result.get("ok"):
-            return {"success": True, "webhook": webhook_url}
-        else:
-            return {"success": False, "error": result.get("description")}
-            
+            if result.get("ok"):
+                return {"success": True, "webhook": webhook_url}
+            else:
+                return {"success": False, "error": result.get("description")}
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")
         return {"success": False, "error": str(e)}
 
 # For local development
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
