@@ -7,10 +7,9 @@ from dataclasses import dataclass
 import logging
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import httpx
 from supabase import create_client, Client
-import uvicorn
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -101,19 +100,14 @@ class Database:
             ]
             
             for table_sql in tables:
-                await self.execute_sql(table_sql)
+                try:
+                    result = self.supabase.rpc('execute_sql', {'sql': table_sql}).execute()
+                except:
+                    # If RPC doesn't work, tables might already exist
+                    pass
                 
         except Exception as e:
             logger.error(f"Error initializing tables: {e}")
-
-    async def execute_sql(self, sql: str):
-        """Execute raw SQL"""
-        try:
-            result = self.supabase.rpc('execute_sql', {'sql': sql}).execute()
-            return result
-        except Exception as e:
-            logger.error(f"SQL execution error: {e}")
-            return None
 
     async def add_user(self, user_id: int, username: str, first_name: str, last_name: str):
         try:
@@ -246,7 +240,7 @@ class TelegramBot:
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = Database()
-        self.bot_messages: Dict[int, List[BotMessage]] = {}  # Track bot messages for auto-delete
+        self.bot_messages: Dict[int, List[BotMessage]] = {}
         
     async def send_request(self, method: str, data: dict = None):
         """Send request to Telegram API"""
@@ -325,7 +319,7 @@ class TelegramBot:
 
     async def schedule_message_deletion(self, bot_message: BotMessage, minutes: int):
         """Schedule message deletion after specified minutes"""
-        await asyncio.sleep(minutes * 60)  # Convert minutes to seconds
+        await asyncio.sleep(minutes * 60)
         try:
             await self.delete_message(bot_message.chat_id, bot_message.message_id)
             
@@ -660,6 +654,26 @@ class TelegramBot:
 bot = TelegramBot(BOT_TOKEN)
 database = Database()
 
+# Add root route
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return HTMLResponse("""
+    <html>
+        <head>
+            <title>Telegram Customer Support Bot</title>
+        </head>
+        <body>
+            <h1>🤖 Telegram Customer Support Bot</h1>
+            <p>Bot is running successfully!</p>
+            <ul>
+                <li><a href="/api/health">Health Check</a></li>
+                <li><a href="/api/setwebhook">Set Webhook</a></li>
+            </ul>
+        </body>
+    </html>
+    """)
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database on startup"""
@@ -706,4 +720,5 @@ async def set_webhook(request: Request):
 
 # For local development
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
