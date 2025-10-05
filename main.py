@@ -70,15 +70,15 @@ class Database:
             # Get total complaints
             total_result = self.supabase.table('complaints').select('id', count='exact').execute()
             total_complaints = total_result.count if total_result.count else 0
-            
+
             # Get pending complaints
             pending_result = self.supabase.table('complaints').select('id', count='exact').eq('status', 'pending').execute()
             pending_complaints = pending_result.count if pending_result.count else 0
-            
+
             # Get resolved complaints
             resolved_result = self.supabase.table('complaints').select('id', count='exact').eq('status', 'resolved').execute()
             resolved_complaints = resolved_result.count if resolved_result.count else 0
-            
+
             return {
                 'total': total_complaints,
                 'pending': pending_complaints,
@@ -202,7 +202,6 @@ class Database:
     async def update_group_settings(self, settings: dict):
         try:
             existing = self.supabase.table('group_settings').select('id').limit(1).execute()
-            
             settings['updated_at'] = datetime.now().isoformat()
             
             if existing.data and len(existing.data) > 0:
@@ -210,7 +209,6 @@ class Database:
                 result = self.supabase.table('group_settings').update(settings).eq('id', settings_id).execute()
             else:
                 result = self.supabase.table('group_settings').insert(settings).execute()
-            
             return result
         except Exception as e:
             logger.error(f"Error updating group settings: {e}")
@@ -222,6 +220,7 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = Database()
         self.bot_messages: Dict[int, List[BotMessage]] = {}
+        self.admin_command_mode: Dict[int, str] = {}  # Track admin command modes
 
     async def send_request(self, method: str, data: dict = None):
         """Send request to Telegram API"""
@@ -245,7 +244,6 @@ class TelegramBot:
         }
         if text:
             data["text"] = text
-        
         return await self.send_request("answerCallbackQuery", data)
 
     async def edit_message_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict = None):
@@ -258,7 +256,6 @@ class TelegramBot:
         }
         if reply_markup:
             data["reply_markup"] = reply_markup
-        
         return await self.send_request("editMessageText", data)
 
     async def send_message(self, chat_id: int, text: str, reply_markup: dict = None, reply_to_message_id: int = None):
@@ -268,18 +265,15 @@ class TelegramBot:
             "text": text,
             "parse_mode": "Markdown"
         }
-        
         if reply_markup:
             data["reply_markup"] = reply_markup
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
 
         result = await self.send_request("sendMessage", data)
-        
         if result and result.get("ok"):
             message_id = result["result"]["message_id"]
             await self.track_bot_message(chat_id, message_id)
-        
         return result
 
     async def delete_message(self, chat_id: int, message_id: int):
@@ -337,8 +331,8 @@ class TelegramBot:
                 
                 if chat_id not in self.bot_messages:
                     self.bot_messages[chat_id] = []
-                
                 self.bot_messages[chat_id].append(bot_message)
+                
                 asyncio.create_task(self.schedule_message_deletion(bot_message, auto_delete_minutes))
         except Exception as e:
             logger.error(f"Error tracking bot message: {e}")
@@ -351,7 +345,7 @@ class TelegramBot:
             
             if bot_message.chat_id in self.bot_messages:
                 self.bot_messages[bot_message.chat_id] = [
-                    msg for msg in self.bot_messages[bot_message.chat_id]
+                    msg for msg in self.bot_messages[bot_message.chat_id] 
                     if msg.message_id != bot_message.message_id
                 ]
         except Exception as e:
@@ -427,7 +421,6 @@ class TelegramBot:
                     "• Follow group rules and guidelines"
                 )
                 await self.send_message(chat_id, welcome_text)
-        
         elif chat_type == "private":
             welcome_text = (
                 "👋 *Welcome to our Customer Support Bot!*\n\n"
@@ -460,6 +453,12 @@ class TelegramBot:
         user = message["from"]
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
+        user_id = user["id"]
+
+        # Check if user is in admin command mode
+        if user_id in self.admin_command_mode:
+            await self.handle_admin_command_input(message)
+            return
 
         result = await self.db.add_complaint(
             user["id"],
@@ -469,7 +468,6 @@ class TelegramBot:
 
         if result and result.data:
             complaint_id = result.data[0]["id"]
-            
             confirmation_text = (
                 f"✅ *Thank you for your message!*\n\n"
                 f"📝 Your complaint has been recorded with ID: *#{complaint_id}*\n\n"
@@ -487,6 +485,43 @@ class TelegramBot:
             )
             await self.send_message(ADMIN_ID, admin_text)
 
+    async def handle_admin_command_input(self, message: dict):
+        """Handle admin command input when in command mode"""
+        user_id = message["from"]["id"]
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "")
+        command_mode = self.admin_command_mode.get(user_id)
+
+        if command_mode == "addban":
+            word = text.strip()
+            if word:
+                await self.db.add_banned_word(word)
+                await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
+            else:
+                await self.send_message(chat_id, "❌ Please provide a valid word.")
+            del self.admin_command_mode[user_id]
+
+        elif command_mode == "removeban":
+            word = text.strip()
+            if word:
+                await self.db.remove_banned_word(word)
+                await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
+            else:
+                await self.send_message(chat_id, "❌ Please provide a valid word.")
+            del self.admin_command_mode[user_id]
+
+        elif command_mode == "addresponse":
+            try:
+                if " | " in text:
+                    trigger, response = text.split(" | ", 1)
+                    await self.db.add_auto_response(trigger.strip(), response.strip())
+                    await self.send_message(chat_id, f"✅ Added auto response for \"{trigger.strip()}\"")
+                else:
+                    await self.send_message(chat_id, "❌ Format: <trigger> | <response>")
+            except Exception as e:
+                await self.send_message(chat_id, "❌ Error adding auto response. Please try again.")
+            del self.admin_command_mode[user_id]
+
     async def handle_banned_word(self, message: dict):
         """Handle message with banned word"""
         user = message["from"]
@@ -498,19 +533,16 @@ class TelegramBot:
 
         warnings = await self.db.get_user_warnings(user["id"])
         warning_count = len(warnings)
-
         settings = await self.db.get_group_settings()
         max_warnings = settings.get("max_warnings", 3)
 
         if warning_count >= max_warnings:
             mute_duration = settings.get("mute_duration", 60)
             mute_until = int((datetime.now() + timedelta(minutes=mute_duration)).timestamp())
-            
             await self.restrict_chat_member(chat_id, user["id"], mute_until)
-            
+
             mute_text = f"🔇 @{user.get('username', user.get('first_name', 'User'))} has been muted for {mute_duration} minutes due to repeated violations."
             await self.send_message(chat_id, mute_text)
-            
             await self.db.clear_user_warnings(user["id"])
         else:
             warning_text = f"⚠️ @{user.get('username', user.get('first_name', 'User'))}, please avoid using banned words. Warning {warning_count}/{max_warnings}"
@@ -533,7 +565,6 @@ class TelegramBot:
         message_id = message["message_id"]
 
         auto_responses = await self.db.get_auto_responses()
-        
         for response_data in auto_responses:
             trigger = response_data["trigger"]
             response = response_data["response"]
@@ -546,25 +577,34 @@ class TelegramBot:
         """Handle admin commands in group"""
         text = message.get("text", "")
         chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
 
         if text == "/closegroup":
             await self.db.update_group_settings({"is_closed": True})
             await self.send_message(chat_id, "🔒 Group has been closed. Only admins can send messages.")
-        
+
         elif text == "/opengroup":
             await self.db.update_group_settings({"is_closed": False})
             await self.send_message(chat_id, "🔓 Group has been opened. Users can send messages.")
-        
+
+        elif text == "/addban":
+            self.admin_command_mode[user_id] = "addban"
+            await self.send_message(chat_id, "📝 Please send the word you want to ban:")
+
         elif text.startswith("/addban "):
             word = text.split(" ", 1)[1]
             await self.db.add_banned_word(word)
             await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
-        
+
+        elif text == "/removeban":
+            self.admin_command_mode[user_id] = "removeban"
+            await self.send_message(chat_id, "📝 Please send the word you want to remove from ban list:")
+
         elif text.startswith("/removeban "):
             word = text.split(" ", 1)[1]
             await self.db.remove_banned_word(word)
             await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
-        
+
         elif text.startswith("/setautodelete "):
             try:
                 minutes = int(text.split(" ", 1)[1])
@@ -580,10 +620,10 @@ class TelegramBot:
         """Handle callback queries"""
         user_id = callback_query["from"]["id"]
         callback_query_id = callback_query["id"]
-        
+
         # Always answer the callback query first
         await self.answer_callback_query(callback_query_id)
-        
+
         if user_id == ADMIN_ID:
             await self.handle_admin_callback(callback_query)
         else:
@@ -598,14 +638,14 @@ class TelegramBot:
         if data == "new_complaint":
             text = "📝 Please write your complaint or question below:\n\n💡 Be as detailed as possible so we can help you better!"
             await self.edit_message_text(chat_id, message_id, text)
-        
+
         elif data == "contact_info":
             contact_text = (
                 "📞 *Contact Information*\n\n"
                 "🤖 Bot Support: Available 24/7\n"
                 "👨‍💼 Admin: Contact through this bot\n"
-                "📧 Email: support@example.com\n"
-                "🌐 Website: https://example.com"
+                "📧 Email: not available\n"
+                "🌐 Website: soon"
             )
             back_keyboard = {
                 "inline_keyboard": [
@@ -613,7 +653,7 @@ class TelegramBot:
                 ]
             }
             await self.edit_message_text(chat_id, message_id, contact_text, back_keyboard)
-        
+
         elif data == "faq":
             faq_text = (
                 "❓ *Frequently Asked Questions*\n\n"
@@ -630,7 +670,7 @@ class TelegramBot:
                 ]
             }
             await self.edit_message_text(chat_id, message_id, faq_text, back_keyboard)
-        
+
         elif data == "back_to_menu":
             welcome_text = (
                 "👋 *Welcome to our Customer Support Bot!*\n\n"
@@ -651,7 +691,7 @@ class TelegramBot:
             users_count = await self.db.get_users_stats()
             auto_responses_count = await self.db.get_auto_responses_stats()
             banned_words = await self.db.get_banned_words()
-            
+
             stats_text = (
                 f"📊 *Bot Statistics*\n\n"
                 f"👥 Total Users: {users_count}\n"
@@ -662,14 +702,13 @@ class TelegramBot:
                 f"🚫 Banned Words: {len(banned_words)}\n\n"
                 f"📈 Resolution Rate: {(complaints_stats['resolved'] / max(complaints_stats['total'], 1) * 100):.1f}%"
             )
-            
             back_keyboard = {
                 "inline_keyboard": [
                     [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
                 ]
             }
             await self.edit_message_text(chat_id, message_id, stats_text, back_keyboard)
-        
+
         elif data == "admin_group_settings":
             settings = await self.db.get_group_settings()
             settings_text = (
@@ -678,7 +717,7 @@ class TelegramBot:
                 f"Max Warnings: {settings.get('max_warnings', 3)}\n"
                 f"Mute Duration: {settings.get('mute_duration', 60)} minutes\n"
                 f"Auto-delete: {settings.get('auto_delete_minutes', 0)} minutes\n\n"
-                f"**Commands:**\n"
+                f"**Commands:**
                 f"`/closegroup` - Close group\n"
                 f"`/opengroup` - Open group\n"
                 f"`/setautodelete <minutes>` - Set auto-delete time (0 to disable)"
@@ -689,14 +728,14 @@ class TelegramBot:
                 ]
             }
             await self.edit_message_text(chat_id, message_id, settings_text, back_keyboard)
-        
+
         elif data == "admin_banned_words":
             banned_words = await self.db.get_banned_words()
             if banned_words:
                 words_list = "\n".join([f"{i+1}. {word['word']}" for i, word in enumerate(banned_words)])
-                text = f"🚫 *Banned Words Management*\n\nCurrent banned words:\n{words_list}\n\nTo add: `/addban <word>`\nTo remove: `/removeban <word>`"
+                text = f"🚫 *Banned Words Management*\n\nCurrent banned words:\n{words_list}\n\nTo add: `/addban <word>` or just `/addban`\nTo remove: `/removeban <word>` or just `/removeban`"
             else:
-                text = "🚫 *Banned Words Management*\n\nNo banned words set.\n\nTo add: `/addban <word>`"
+                text = "🚫 *Banned Words Management*\n\nNo banned words set.\n\nTo add: `/addban <word>` or just `/addban`"
             
             back_keyboard = {
                 "inline_keyboard": [
@@ -704,7 +743,7 @@ class TelegramBot:
                 ]
             }
             await self.edit_message_text(chat_id, message_id, text, back_keyboard)
-        
+
         elif data == "admin_auto_responses":
             auto_responses = await self.db.get_auto_responses()
             if auto_responses:
@@ -718,8 +757,8 @@ class TelegramBot:
                     [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
                 ]
             }
-                        await self.edit_message_text(chat_id, message_id, text, back_keyboard)
-        
+            await self.edit_message_text(chat_id, message_id, text, back_keyboard)
+
         elif data == "admin_complaints":
             complaints_stats = await self.db.get_complaints_stats()
             complaints_text = (
@@ -729,14 +768,13 @@ class TelegramBot:
                 f"✅ Resolved: {complaints_stats['resolved']}\n\n"
                 f"Use `/reply <user_id> <message>` to respond to complaints"
             )
-            
             back_keyboard = {
                 "inline_keyboard": [
                     [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
                 ]
             }
             await self.edit_message_text(chat_id, message_id, complaints_text, back_keyboard)
-        
+
         elif data == "back_to_admin":
             admin_text = "🔧 *Admin Control Panel*\n\nWelcome to the admin dashboard. Choose an option:"
             await self.edit_message_text(chat_id, message_id, admin_text, self.get_admin_keyboard())
@@ -765,14 +803,23 @@ class TelegramBot:
                             reply_message = f"💬 *Response from Admin:*\n\n{reply_text}\n\nIf you have more questions, feel free to ask!"
                             await self.send_message(target_user_id, reply_message)
                             await self.send_message(ADMIN_ID, "✅ Reply sent successfully!")
+                    elif user_id == ADMIN_ID and text == "/addban":
+                        self.admin_command_mode[user_id] = "addban"
+                        await self.send_message(chat_id, "📝 Please send the word you want to ban:")
                     elif user_id == ADMIN_ID and text.startswith("/addban "):
                         word = text.split(" ", 1)[1]
                         await self.db.add_banned_word(word)
                         await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
+                    elif user_id == ADMIN_ID and text == "/removeban":
+                        self.admin_command_mode[user_id] = "removeban"
+                        await self.send_message(chat_id, "📝 Please send the word you want to remove from ban list:")
                     elif user_id == ADMIN_ID and text.startswith("/removeban "):
                         word = text.split(" ", 1)[1]
                         await self.db.remove_banned_word(word)
                         await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
+                    elif user_id == ADMIN_ID and text == "/addresponse":
+                        self.admin_command_mode[user_id] = "addresponse"
+                        await self.send_message(chat_id, "📝 Please send the auto response in format:\n<trigger> | <response>")
                     elif user_id == ADMIN_ID and text.startswith("/addresponse "):
                         try:
                             content = text.split(" ", 1)[1]
@@ -859,7 +906,6 @@ async def set_webhook(request: Request):
                 json={"url": webhook_url}
             )
             result = response.json()
-            
             if result.get("ok"):
                 return {"success": True, "webhook": webhook_url}
             else:
@@ -870,3 +916,4 @@ async def set_webhook(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
