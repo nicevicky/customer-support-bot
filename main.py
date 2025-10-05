@@ -717,11 +717,12 @@ class TelegramBot:
                 f"Max Warnings: {settings.get('max_warnings', 3)}\n"
                 f"Mute Duration: {settings.get('mute_duration', 60)} minutes\n"
                 f"Auto-delete: {settings.get('auto_delete_minutes', 0)} minutes\n\n"
-                f"**Commands:**
+                f"**Commands:**\n"
                 f"`/closegroup` - Close group\n"
                 f"`/opengroup` - Open group\n"
                 f"`/setautodelete <minutes>` - Set auto-delete time (0 to disable)"
             )
+
             back_keyboard = {
                 "inline_keyboard": [
                     [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
