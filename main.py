@@ -64,6 +64,48 @@ class Database:
             logger.error(f"Error adding complaint: {e}")
             return None
 
+    async def get_complaints_stats(self):
+        """Get complaints statistics"""
+        try:
+            # Get total complaints
+            total_result = self.supabase.table('complaints').select('id', count='exact').execute()
+            total_complaints = total_result.count if total_result.count else 0
+            
+            # Get pending complaints
+            pending_result = self.supabase.table('complaints').select('id', count='exact').eq('status', 'pending').execute()
+            pending_complaints = pending_result.count if pending_result.count else 0
+            
+            # Get resolved complaints
+            resolved_result = self.supabase.table('complaints').select('id', count='exact').eq('status', 'resolved').execute()
+            resolved_complaints = resolved_result.count if resolved_result.count else 0
+            
+            return {
+                'total': total_complaints,
+                'pending': pending_complaints,
+                'resolved': resolved_complaints
+            }
+        except Exception as e:
+            logger.error(f"Error getting complaints stats: {e}")
+            return {'total': 0, 'pending': 0, 'resolved': 0}
+
+    async def get_users_stats(self):
+        """Get users statistics"""
+        try:
+            result = self.supabase.table('users').select('id', count='exact').execute()
+            return result.count if result.count else 0
+        except Exception as e:
+            logger.error(f"Error getting users stats: {e}")
+            return 0
+
+    async def get_auto_responses_stats(self):
+        """Get auto responses statistics"""
+        try:
+            result = self.supabase.table('auto_responses').select('id', count='exact').execute()
+            return result.count if result.count else 0
+        except Exception as e:
+            logger.error(f"Error getting auto responses stats: {e}")
+            return 0
+
     async def get_banned_words(self):
         try:
             result = self.supabase.table('banned_words').select('word').execute()
@@ -142,7 +184,6 @@ class Database:
             if result.data and len(result.data) > 0:
                 return result.data[0]
             else:
-                # Return default settings if none exist
                 return {
                     'is_closed': False,
                     'max_warnings': 3,
@@ -151,7 +192,6 @@ class Database:
                 }
         except Exception as e:
             logger.error(f"Error getting group settings: {e}")
-            # Return default settings on error
             return {
                 'is_closed': False,
                 'max_warnings': 3,
@@ -161,17 +201,14 @@ class Database:
 
     async def update_group_settings(self, settings: dict):
         try:
-            # First, try to get existing settings
             existing = self.supabase.table('group_settings').select('id').limit(1).execute()
             
             settings['updated_at'] = datetime.now().isoformat()
             
             if existing.data and len(existing.data) > 0:
-                # Update existing record
                 settings_id = existing.data[0]['id']
                 result = self.supabase.table('group_settings').update(settings).eq('id', settings_id).execute()
             else:
-                # Insert new record
                 result = self.supabase.table('group_settings').insert(settings).execute()
             
             return result
@@ -200,6 +237,30 @@ class TelegramBot:
                 logger.error(f"Error sending request to Telegram: {e}")
                 return None
 
+    async def answer_callback_query(self, callback_query_id: str, text: str = None, show_alert: bool = False):
+        """Answer callback query"""
+        data = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert
+        }
+        if text:
+            data["text"] = text
+        
+        return await self.send_request("answerCallbackQuery", data)
+
+    async def edit_message_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict = None):
+        """Edit message text"""
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        if reply_markup:
+            data["reply_markup"] = reply_markup
+        
+        return await self.send_request("editMessageText", data)
+
     async def send_message(self, chat_id: int, text: str, reply_markup: dict = None, reply_to_message_id: int = None):
         """Send message to Telegram"""
         data = {
@@ -215,7 +276,6 @@ class TelegramBot:
 
         result = await self.send_request("sendMessage", data)
         
-        # Track bot message for auto-delete
         if result and result.get("ok"):
             message_id = result["result"]["message_id"]
             await self.track_bot_message(chat_id, message_id)
@@ -279,8 +339,6 @@ class TelegramBot:
                     self.bot_messages[chat_id] = []
                 
                 self.bot_messages[chat_id].append(bot_message)
-                
-                # Schedule deletion
                 asyncio.create_task(self.schedule_message_deletion(bot_message, auto_delete_minutes))
         except Exception as e:
             logger.error(f"Error tracking bot message: {e}")
@@ -288,10 +346,9 @@ class TelegramBot:
     async def schedule_message_deletion(self, bot_message: BotMessage, minutes: int):
         """Schedule message deletion after specified minutes"""
         try:
-            await asyncio.sleep(minutes * 60)  # Convert minutes to seconds
+            await asyncio.sleep(minutes * 60)
             await self.delete_message(bot_message.chat_id, bot_message.message_id)
             
-            # Remove from tracking
             if bot_message.chat_id in self.bot_messages:
                 self.bot_messages[bot_message.chat_id] = [
                     msg for msg in self.bot_messages[bot_message.chat_id]
@@ -340,7 +397,6 @@ class TelegramBot:
         chat_type = message["chat"]["type"]
         user_id = user["id"]
 
-        # Add user to database
         await self.db.add_user(
             user["id"],
             user.get("username", ""),
@@ -349,19 +405,28 @@ class TelegramBot:
         )
 
         if chat_type in ["group", "supergroup"]:
-            if not await self.is_admin(chat_id, user_id):
-                return
-            
-            admin_group_text = (
-                "🔧 *Admin Group Commands:*\n\n"
-                "/closegroup - Close group for users\n"
-                "/opengroup - Open group for users\n"
-                "/addban <word> - Add banned word\n"
-                "/removeban <word> - Remove banned word\n"
-                "/setautodelete <minutes> - Set auto-delete time\n"
-                "/admin - Show admin panel"
-            )
-            await self.send_message(chat_id, admin_group_text)
+            # Bot can respond in groups now
+            if await self.is_admin(chat_id, user_id) or user_id == ADMIN_ID:
+                admin_group_text = (
+                    "🔧 *Admin Group Commands:*\n\n"
+                    "/closegroup - Close group for users\n"
+                    "/opengroup - Open group for users\n"
+                    "/addban <word> - Add banned word\n"
+                    "/removeban <word> - Remove banned word\n"
+                    "/setautodelete <minutes> - Set auto-delete time\n"
+                    "/admin - Show admin panel"
+                )
+                await self.send_message(chat_id, admin_group_text)
+            else:
+                # Regular users can also start the bot in group
+                welcome_text = (
+                    "👋 *Welcome!*\n\n"
+                    "I'm your customer support bot. You can:\n"
+                    "• Send me a private message for support\n"
+                    "• Use commands here if you're an admin\n"
+                    "• Follow group rules and guidelines"
+                )
+                await self.send_message(chat_id, welcome_text)
         
         elif chat_type == "private":
             welcome_text = (
@@ -378,10 +443,13 @@ class TelegramBot:
         chat_type = message["chat"]["type"]
 
         if user_id != ADMIN_ID:
+            if chat_type == "private":
+                await self.send_message(chat_id, "❌ You don't have admin permissions.")
             return
 
         if chat_type in ["group", "supergroup"]:
             if not await self.is_admin(chat_id, user_id):
+                await self.send_message(chat_id, "❌ You need to be a group admin to use this command.")
                 return
 
         admin_text = "🔧 *Admin Control Panel*\n\nWelcome to the admin dashboard. Choose an option:"
@@ -511,6 +579,10 @@ class TelegramBot:
     async def handle_callback_query(self, callback_query: dict):
         """Handle callback queries"""
         user_id = callback_query["from"]["id"]
+        callback_query_id = callback_query["id"]
+        
+        # Always answer the callback query first
+        await self.answer_callback_query(callback_query_id)
         
         if user_id == ADMIN_ID:
             await self.handle_admin_callback(callback_query)
@@ -521,10 +593,11 @@ class TelegramBot:
         """Handle user callback queries"""
         data = callback_query["data"]
         chat_id = callback_query["message"]["chat"]["id"]
+        message_id = callback_query["message"]["message_id"]
 
         if data == "new_complaint":
             text = "📝 Please write your complaint or question below:\n\n💡 Be as detailed as possible so we can help you better!"
-            await self.send_message(chat_id, text)
+            await self.edit_message_text(chat_id, message_id, text)
         
         elif data == "contact_info":
             contact_text = (
@@ -534,7 +607,12 @@ class TelegramBot:
                 "📧 Email: support@example.com\n"
                 "🌐 Website: https://example.com"
             )
-            await self.send_message(chat_id, contact_text)
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Menu", "callback_data": "back_to_menu"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, contact_text, back_keyboard)
         
         elif data == "faq":
             faq_text = (
@@ -546,14 +624,53 @@ class TelegramBot:
                 "**Q: Is this service free?**\n"
                 "A: Yes, our support is completely free!"
             )
-            await self.send_message(chat_id, faq_text)
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Menu", "callback_data": "back_to_menu"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, faq_text, back_keyboard)
+        
+        elif data == "back_to_menu":
+            welcome_text = (
+                "👋 *Welcome to our Customer Support Bot!*\n\n"
+                "🎯 How can we help you today?\n\n"
+                "Please choose an option below or write your complaint/question and we'll get back to you soon!"
+            )
+            await self.edit_message_text(chat_id, message_id, welcome_text, self.get_main_menu_keyboard())
 
     async def handle_admin_callback(self, callback_query: dict):
         """Handle admin callback queries"""
         data = callback_query["data"]
         chat_id = callback_query["message"]["chat"]["id"]
+        message_id = callback_query["message"]["message_id"]
 
-        if data == "admin_group_settings":
+        if data == "admin_statistics":
+            # Get statistics
+            complaints_stats = await self.db.get_complaints_stats()
+            users_count = await self.db.get_users_stats()
+            auto_responses_count = await self.db.get_auto_responses_stats()
+            banned_words = await self.db.get_banned_words()
+            
+            stats_text = (
+                f"📊 *Bot Statistics*\n\n"
+                f"👥 Total Users: {users_count}\n"
+                f"📋 Total Complaints: {complaints_stats['total']}\n"
+                f"⏳ Pending Complaints: {complaints_stats['pending']}\n"
+                f"✅ Resolved Complaints: {complaints_stats['resolved']}\n"
+                f"🤖 Auto Responses: {auto_responses_count}\n"
+                f"🚫 Banned Words: {len(banned_words)}\n\n"
+                f"📈 Resolution Rate: {(complaints_stats['resolved'] / max(complaints_stats['total'], 1) * 100):.1f}%"
+            )
+            
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, stats_text, back_keyboard)
+        
+        elif data == "admin_group_settings":
             settings = await self.db.get_group_settings()
             settings_text = (
                 f"⚙️ *Group Settings*\n\n"
@@ -566,7 +683,12 @@ class TelegramBot:
                 f"`/opengroup` - Open group\n"
                 f"`/setautodelete <minutes>` - Set auto-delete time (0 to disable)"
             )
-            await self.send_message(chat_id, settings_text)
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, settings_text, back_keyboard)
         
         elif data == "admin_banned_words":
             banned_words = await self.db.get_banned_words()
@@ -575,7 +697,49 @@ class TelegramBot:
                 text = f"🚫 *Banned Words Management*\n\nCurrent banned words:\n{words_list}\n\nTo add: `/addban <word>`\nTo remove: `/removeban <word>`"
             else:
                 text = "🚫 *Banned Words Management*\n\nNo banned words set.\n\nTo add: `/addban <word>`"
-            await self.send_message(chat_id, text)
+            
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, text, back_keyboard)
+        
+        elif data == "admin_auto_responses":
+            auto_responses = await self.db.get_auto_responses()
+            if auto_responses:
+                responses_list = "\n".join([f"{i+1}. {resp['trigger']} → {resp['response'][:50]}..." for i, resp in enumerate(auto_responses)])
+                text = f"🤖 *Auto Responses Management*\n\nCurrent auto responses:\n{responses_list}\n\nTo add: `/addresponse <trigger> | <response>`"
+            else:
+                text = "🤖 *Auto Responses Management*\n\nNo auto responses set.\n\nTo add: `/addresponse <trigger> | <response>`"
+            
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
+                ]
+            }
+                        await self.edit_message_text(chat_id, message_id, text, back_keyboard)
+        
+        elif data == "admin_complaints":
+            complaints_stats = await self.db.get_complaints_stats()
+            complaints_text = (
+                f"📋 *Complaints Management*\n\n"
+                f"📊 Total: {complaints_stats['total']}\n"
+                f"⏳ Pending: {complaints_stats['pending']}\n"
+                f"✅ Resolved: {complaints_stats['resolved']}\n\n"
+                f"Use `/reply <user_id> <message>` to respond to complaints"
+            )
+            
+            back_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔙 Back to Admin Panel", "callback_data": "back_to_admin"}]
+                ]
+            }
+            await self.edit_message_text(chat_id, message_id, complaints_text, back_keyboard)
+        
+        elif data == "back_to_admin":
+            admin_text = "🔧 *Admin Control Panel*\n\nWelcome to the admin dashboard. Choose an option:"
+            await self.edit_message_text(chat_id, message_id, admin_text, self.get_admin_keyboard())
 
     async def process_update(self, update: dict):
         """Process incoming update"""
@@ -601,16 +765,36 @@ class TelegramBot:
                             reply_message = f"💬 *Response from Admin:*\n\n{reply_text}\n\nIf you have more questions, feel free to ask!"
                             await self.send_message(target_user_id, reply_message)
                             await self.send_message(ADMIN_ID, "✅ Reply sent successfully!")
+                    elif user_id == ADMIN_ID and text.startswith("/addban "):
+                        word = text.split(" ", 1)[1]
+                        await self.db.add_banned_word(word)
+                        await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
+                    elif user_id == ADMIN_ID and text.startswith("/removeban "):
+                        word = text.split(" ", 1)[1]
+                        await self.db.remove_banned_word(word)
+                        await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
+                    elif user_id == ADMIN_ID and text.startswith("/addresponse "):
+                        try:
+                            content = text.split(" ", 1)[1]
+                            trigger, response = content.split(" | ", 1)
+                            await self.db.add_auto_response(trigger.strip(), response.strip())
+                            await self.send_message(chat_id, f"✅ Added auto response for \"{trigger}\"")
+                        except ValueError:
+                            await self.send_message(chat_id, "❌ Format: /addresponse <trigger> | <response>")
                     else:
                         await self.handle_complaint(message)
                 elif GROUP_ID and str(chat_id) == GROUP_ID:
+                    # Handle group messages
                     if user_id == ADMIN_ID or await self.is_admin(chat_id, user_id):
                         await self.handle_admin_group_commands(message)
                     else:
                         settings = await self.db.get_group_settings()
                         if settings.get("is_closed"):
                             await self.delete_message(chat_id, message["message_id"])
-                            await self.send_message(chat_id, "🔒 Group is currently closed. Messages are not allowed.")
+                            warning_msg = await self.send_message(chat_id, "🔒 Group is currently closed. Messages are not allowed.")
+                            # Auto-delete warning message after 5 seconds
+                            if warning_msg and warning_msg.get("ok"):
+                                asyncio.create_task(self.auto_delete_warning(chat_id, warning_msg["result"]["message_id"]))
                             return
 
                         if await self.check_banned_words(text):
@@ -618,12 +802,31 @@ class TelegramBot:
                             return
 
                         await self.check_auto_responses(message)
+                elif chat_type in ["group", "supergroup"]:
+                    # Handle other groups (not the main support group)
+                    if text.startswith("/start") or text.startswith("/admin"):
+                        # Allow bot commands in any group
+                        if text.startswith("/start"):
+                            await self.handle_start(message)
+                        elif text.startswith("/admin"):
+                            await self.handle_admin_command(message)
+                    elif user_id == ADMIN_ID or await self.is_admin(chat_id, user_id):
+                        # Allow admin commands in any group for admins
+                        await self.handle_admin_group_commands(message)
 
             elif "callback_query" in update:
                 await self.handle_callback_query(update["callback_query"])
 
         except Exception as e:
             logger.error(f"Error processing update: {e}")
+
+    async def auto_delete_warning(self, chat_id: int, message_id: int):
+        """Auto-delete warning message after 5 seconds"""
+        try:
+            await asyncio.sleep(5)
+            await self.delete_message(chat_id, message_id)
+        except Exception as e:
+            logger.error(f"Error auto-deleting warning message: {e}")
 
 # Initialize bot
 bot = TelegramBot(BOT_TOKEN)
