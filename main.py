@@ -178,31 +178,38 @@ class Database:
             logger.error(f"Error clearing user warnings: {e}")
             return None
 
-    async def get_group_settings(self):
+    async def get_group_settings(self, chat_id: int = None):
+        """Get group settings for specific chat or default"""
         try:
-            result = self.supabase.table('group_settings').select('*').limit(1).execute()
-            if result.data and len(result.data) > 0:
-                return result.data[0]
-            else:
-                return {
-                    'is_closed': False,
-                    'max_warnings': 3,
-                    'mute_duration': 60,
-                    'auto_delete_minutes': 0
-                }
+            if chat_id:
+                result = self.supabase.table('group_settings').select('*').eq('chat_id', chat_id).limit(1).execute()
+                if result.data and len(result.data) > 0:
+                    return result.data[0]
+            
+            # Return default settings if no specific settings found
+            return {
+                'chat_id': chat_id,
+                'is_closed': False,
+                'max_warnings': 3,
+                'mute_duration': 60,
+                'auto_delete_minutes': 0
+            }
         except Exception as e:
             logger.error(f"Error getting group settings: {e}")
             return {
+                'chat_id': chat_id,
                 'is_closed': False,
                 'max_warnings': 3,
                 'mute_duration': 60,
                 'auto_delete_minutes': 0
             }
 
-    async def update_group_settings(self, settings: dict):
+    async def update_group_settings(self, chat_id: int, settings: dict):
+        """Update group settings for specific chat"""
         try:
-            existing = self.supabase.table('group_settings').select('id').limit(1).execute()
+            existing = self.supabase.table('group_settings').select('id').eq('chat_id', chat_id).limit(1).execute()
             settings['updated_at'] = datetime.now().isoformat()
+            settings['chat_id'] = chat_id
             
             if existing.data and len(existing.data) > 0:
                 settings_id = existing.data[0]['id']
@@ -319,7 +326,7 @@ class TelegramBot:
     async def track_bot_message(self, chat_id: int, message_id: int):
         """Track bot message for auto-delete"""
         try:
-            settings = await self.db.get_group_settings()
+            settings = await self.db.get_group_settings(chat_id)
             auto_delete_minutes = settings.get('auto_delete_minutes', 0)
             
             if auto_delete_minutes > 0:
@@ -410,7 +417,7 @@ class TelegramBot:
                     "/setautodelete <minutes> - Set auto-delete time\n"
                     "/admin - Show admin panel"
                 )
-                await self.send_message(chat_id, admin_group_text)
+                await self.send_message(chat_id, admin_group_text, reply_to_message_id=message["message_id"])
             else:
                 # Regular users can also start the bot in group
                 welcome_text = (
@@ -420,7 +427,7 @@ class TelegramBot:
                     "• Use commands here if you're an admin\n"
                     "• Follow group rules and guidelines"
                 )
-                await self.send_message(chat_id, welcome_text)
+                await self.send_message(chat_id, welcome_text, reply_to_message_id=message["message_id"])
         elif chat_type == "private":
             welcome_text = (
                 "👋 *Welcome to our Customer Support Bot!*\n\n"
@@ -442,11 +449,12 @@ class TelegramBot:
 
         if chat_type in ["group", "supergroup"]:
             if not await self.is_admin(chat_id, user_id):
-                await self.send_message(chat_id, "❌ You need to be a group admin to use this command.")
+                await self.send_message(chat_id, "❌ You need to be a group admin to use this command.", reply_to_message_id=message["message_id"])
                 return
 
         admin_text = "🔧 *Admin Control Panel*\n\nWelcome to the admin dashboard. Choose an option:"
-        await self.send_message(chat_id, admin_text, self.get_admin_keyboard())
+        reply_to = message["message_id"] if chat_type in ["group", "supergroup"] else None
+        await self.send_message(chat_id, admin_text, self.get_admin_keyboard(), reply_to_message_id=reply_to)
 
     async def handle_complaint(self, message: dict):
         """Handle user complaint"""
@@ -533,7 +541,7 @@ class TelegramBot:
 
         warnings = await self.db.get_user_warnings(user["id"])
         warning_count = len(warnings)
-        settings = await self.db.get_group_settings()
+        settings = await self.db.get_group_settings(chat_id)
         max_warnings = settings.get("max_warnings", 3)
 
         if warning_count >= max_warnings:
@@ -578,43 +586,44 @@ class TelegramBot:
         text = message.get("text", "")
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
+        message_id = message["message_id"]
 
         if text == "/closegroup":
-            await self.db.update_group_settings({"is_closed": True})
-            await self.send_message(chat_id, "🔒 Group has been closed. Only admins can send messages.")
+            await self.db.update_group_settings(chat_id, {"is_closed": True})
+            await self.send_message(chat_id, "🔒 Group has been closed. Only admins can send messages.", reply_to_message_id=message_id)
 
         elif text == "/opengroup":
-            await self.db.update_group_settings({"is_closed": False})
-            await self.send_message(chat_id, "🔓 Group has been opened. Users can send messages.")
+            await self.db.update_group_settings(chat_id, {"is_closed": False})
+            await self.send_message(chat_id, "🔓 Group has been opened. Users can send messages.", reply_to_message_id=message_id)
 
         elif text == "/addban":
             self.admin_command_mode[user_id] = "addban"
-            await self.send_message(chat_id, "📝 Please send the word you want to ban:")
+            await self.send_message(chat_id, "📝 Please send the word you want to ban:", reply_to_message_id=message_id)
 
         elif text.startswith("/addban "):
             word = text.split(" ", 1)[1]
             await self.db.add_banned_word(word)
-            await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.")
+            await self.send_message(chat_id, f"✅ Added \"{word}\" to banned words list.", reply_to_message_id=message_id)
 
         elif text == "/removeban":
             self.admin_command_mode[user_id] = "removeban"
-            await self.send_message(chat_id, "📝 Please send the word you want to remove from ban list:")
+            await self.send_message(chat_id, "📝 Please send the word you want to remove from ban list:", reply_to_message_id=message_id)
 
         elif text.startswith("/removeban "):
             word = text.split(" ", 1)[1]
             await self.db.remove_banned_word(word)
-            await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.")
+            await self.send_message(chat_id, f"✅ Removed \"{word}\" from banned words list.", reply_to_message_id=message_id)
 
         elif text.startswith("/setautodelete "):
             try:
                 minutes = int(text.split(" ", 1)[1])
-                await self.db.update_group_settings({"auto_delete_minutes": minutes})
+                await self.db.update_group_settings(chat_id, {"auto_delete_minutes": minutes})
                 if minutes > 0:
-                    await self.send_message(chat_id, f"✅ Bot messages will now be auto-deleted after {minutes} minutes.")
+                    await self.send_message(chat_id, f"✅ Bot messages will now be auto-deleted after {minutes} minutes.", reply_to_message_id=message_id)
                 else:
-                    await self.send_message(chat_id, "✅ Auto-delete disabled.")
+                    await self.send_message(chat_id, "✅ Auto-delete disabled.", reply_to_message_id=message_id)
             except ValueError:
-                await self.send_message(chat_id, "❌ Please provide a valid number of minutes.")
+                await self.send_message(chat_id, "❌ Please provide a valid number of minutes.", reply_to_message_id=message_id)
 
     async def handle_callback_query(self, callback_query: dict):
         """Handle callback queries"""
@@ -710,7 +719,7 @@ class TelegramBot:
             await self.edit_message_text(chat_id, message_id, stats_text, back_keyboard)
 
         elif data == "admin_group_settings":
-            settings = await self.db.get_group_settings()
+            settings = await self.db.get_group_settings(chat_id)
             settings_text = (
                 f"⚙️ *Group Settings*\n\n"
                 f"Group Status: {'🔒 Closed' if settings.get('is_closed') else '🔓 Open'}\n"
@@ -831,12 +840,23 @@ class TelegramBot:
                             await self.send_message(chat_id, "❌ Format: /addresponse <trigger> | <response>")
                     else:
                         await self.handle_complaint(message)
-                elif GROUP_ID and str(chat_id) == GROUP_ID:
+                elif chat_type in ["group", "supergroup"]:
                     # Handle group messages
                     if user_id == ADMIN_ID or await self.is_admin(chat_id, user_id):
-                        await self.handle_admin_group_commands(message)
+                        # Admin commands in group
+                        if text in ["/closegroup", "/opengroup"] or text.startswith(("/addban", "/removeban", "/setautodelete")):
+                            await self.handle_admin_group_commands(message)
+                        elif text.startswith("/start") or text.startswith("/admin"):
+                            # Allow bot commands in any group
+                            if text.startswith("/start"):
+                                await self.handle_start(message)
+                            elif text.startswith("/admin"):
+                                await self.handle_admin_command(message)
                     else:
-                        settings = await self.db.get_group_settings()
+                        # Regular user messages in group
+                        settings = await self.db.get_group_settings(chat_id)
+                        
+                        # Check if group is closed
                         if settings.get("is_closed"):
                             await self.delete_message(chat_id, message["message_id"])
                             warning_msg = await self.send_message(chat_id, "🔒 Group is currently closed. Messages are not allowed.")
@@ -845,22 +865,13 @@ class TelegramBot:
                                 asyncio.create_task(self.auto_delete_warning(chat_id, warning_msg["result"]["message_id"]))
                             return
 
+                        # Check for banned words
                         if await self.check_banned_words(text):
                             await self.handle_banned_word(message)
                             return
 
+                        # Check for auto responses
                         await self.check_auto_responses(message)
-                elif chat_type in ["group", "supergroup"]:
-                    # Handle other groups (not the main support group)
-                    if text.startswith("/start") or text.startswith("/admin"):
-                        # Allow bot commands in any group
-                        if text.startswith("/start"):
-                            await self.handle_start(message)
-                        elif text.startswith("/admin"):
-                            await self.handle_admin_command(message)
-                    elif user_id == ADMIN_ID or await self.is_admin(chat_id, user_id):
-                        # Allow admin commands in any group for admins
-                        await self.handle_admin_group_commands(message)
 
             elif "callback_query" in update:
                 await self.handle_callback_query(update["callback_query"])
@@ -917,4 +928,4 @@ async def set_webhook(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
+                                                         
